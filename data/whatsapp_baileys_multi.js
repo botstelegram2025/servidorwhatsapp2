@@ -1,265 +1,221 @@
 // whatsapp_baileys_multi.js  (ESM)
-import express from "express";
-import cors from "cors";
-import pino from "pino";
-import QRCode from "qrcode";
-import makeWASocket, {
-  useMultiFileAuthState,
+import express from 'express';
+import cors from 'cors';
+import morgan from 'morgan';
+import fs from 'fs';
+import fsp from 'fs/promises';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import qrcode from 'qrcode';
+import P from 'pino';
+import {
+  makeWASocket,
   DisconnectReason,
-  fetchLatestBaileysVersion
-} from "@whiskeysockets/baileys";
-import path from "node:path";
-import fs from "node:fs/promises";
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  Browsers
+} from '@whiskeysockets/baileys';
 
-const log = pino({ level: process.env.LOG_LEVEL || "info" });
-const app = express();
-app.use(cors());
-app.use(express.json());
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-// Config
-const PORT = process.env.PORT || 3001;
-const SESSIONS_DIR = process.env.SESSIONS_DIR || "/data/sessions";
-const QR_TTL_MS = 60_000; // mantém o QR por 60s
-await fs.mkdir(SESSIONS_DIR, { recursive: true });
+const PORT = process.env.PORT || 8080;
+const SESSIONS_DIR = process.env.SESSIONS_DIR || path.join(__dirname, 'sessions');
 
-// Mapa de instâncias
-const instances = new Map();
-/*
-instances.set(id, {
-  sock,
-  state, saveCreds,
-  lastQr: { code, dataUrl, ts },
-  connected: boolean,
-  phone: string|null,
-  stateStr: "open"/"connecting"/"close"/"unknown"
-});
-*/
-
-function asId(v) {
-  // normaliza id (string sempre)
-  return String(v).trim();
+if (!fs.existsSync(SESSIONS_DIR)) {
+  fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 }
 
-async function ensureInstance(id) {
-  id = asId(id);
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '1mb' }));
+app.use(morgan('tiny'));
 
-  if (instances.has(id)) {
-    return instances.get(id);
+const instances = new Map(); // id -> { sock, qr, lastQrAt, connected, state }
+
+// util
+const wait = (ms) => new Promise(r => setTimeout(r, ms));
+const j = (...xs) => path.join(...xs);
+const jidFromNumber = (n) => `${n.replace(/\D/g, '')}@s.whatsapp.net`;
+
+async function destroyAuth(id) {
+  const p = j(SESSIONS_DIR, String(id));
+  if (fs.existsSync(p)) {
+    await fsp.rm(p, { recursive: true, force: true });
+  }
+}
+
+async function ensureInstance(id, { forceNew = false } = {}) {
+  id = String(id);
+  if (forceNew) {
+    await destroyAuth(id);
+    if (instances.has(id)) {
+      try { await instances.get(id).sock?.logout?.(); } catch { /* ignore */ }
+      instances.delete(id);
+    }
   }
 
-  const sessionPath = path.join(SESSIONS_DIR, id);
-  await fs.mkdir(sessionPath, { recursive: true });
+  if (instances.has(id)) return instances.get(id);
 
-  const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
-  const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1015901307] }));
+  const authPath = j(SESSIONS_DIR, id);
+  const { state, saveCreds } = await useMultiFileAuthState(authPath);
+  const { version } = await fetchLatestBaileysVersion();
 
+  const logger = P({ level: 'error' }); // silencioso
   const sock = makeWASocket({
     version,
+    logger,
     auth: state,
     printQRInTerminal: false, // deprecado
-    browser: ["Railway", "Chrome", "20.0"]
+    browser: Browsers.appropriate('Chrome')
   });
 
-  const ctx = {
+  const data = {
     sock,
-    state,
-    saveCreds,
-    lastQr: null,
+    qr: null,
+    lastQrAt: null,
     connected: false,
-    phone: null,
-    stateStr: "connecting"
+    state: 'starting',
+    saveCreds
   };
-  instances.set(id, ctx);
+  instances.set(id, data);
 
-  sock.ev.on("creds.update", saveCreds);
+  sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
+  sock.ev.on('connection.update', async (u) => {
+    const { connection, lastDisconnect, qr } = u;
 
     if (qr) {
-      // Guarda o QR e também gera dataURL para front (se quiser)
-      const dataUrl = await QRCode.toDataURL(qr).catch(() => null);
-      ctx.lastQr = { code: qr, dataUrl, ts: Date.now() };
-      log.info({ id }, "QR atualizado para a instância");
-      // Expira o QR após TTL (evita servir QR velho)
-      setTimeout(() => {
-        if (ctx.lastQr && Date.now() - ctx.lastQr.ts >= QR_TTL_MS) {
-          ctx.lastQr = null;
-        }
-      }, QR_TTL_MS + 1000);
-    }
-
-    if (connection === "open") {
-      ctx.connected = true;
-      ctx.stateStr = "open";
-      // tenta obter o número logado
       try {
-        const me = await sock.user;
-        ctx.phone = me?.id || me?.jid || null;
-      } catch {}
-      log.info({ id, phone: ctx.phone }, "Conectado ao WhatsApp");
+        const dataUrl = await qrcode.toDataURL(qr, { margin: 1, scale: 6 });
+        data.qr = dataUrl;
+        data.lastQrAt = Date.now();
+        data.state = 'qr';
+      } catch (e) {
+        data.qr = null;
+      }
     }
 
-    if (connection === "close") {
-      ctx.connected = false;
-      ctx.stateStr = "close";
-      const code = lastDisconnect?.error?.output?.statusCode || lastDisconnect?.error?.status || lastDisconnect?.error?.code;
-      log.warn({ id, code }, "Conexão encerrada");
-      // reconecta automaticamente exceto em banimento ou logout explícito
-      const shouldReconnect =
-        code !== DisconnectReason.loggedOut && code !== DisconnectReason.badSession;
-      if (shouldReconnect) {
-        setTimeout(async () => {
-          try {
-            // recria do zero para forçar QR novo
-            instances.delete(id);
-            await ensureInstance(id);
-            log.info({ id }, "Instância recriada após close");
-          } catch (err) {
-            log.error({ id, err }, "Falha ao recriar instância");
-          }
-        }, 1500);
+    if (connection === 'open') {
+      data.connected = true;
+      data.state = 'open';
+      data.qr = null;
+    }
+
+    if (connection === 'close') {
+      data.connected = false;
+      data.state = 'close';
+      const reason = lastDisconnect?.error?.output?.statusCode || lastDisconnect?.error?.code;
+      // se não foi logout explícito, tenta reconectar
+      if (reason !== DisconnectReason.loggedOut) {
+        await wait(1000);
+        try {
+          ensureInstance(id); // reconecta
+        } catch { /* ignore */ }
       }
     }
   });
 
-  sock.ev.on("messages.upsert", (m) => {
-    // opcional: logs resumidos
-    const count = m?.messages?.length || 0;
-    if (count) log.debug({ id, count, type: m.type }, "messages.upsert");
-  });
-
-  return ctx;
+  return data;
 }
 
-app.get("/health", (_req, res) => {
-  res.json({ success: true, status: "ok", uptime: process.uptime() });
+/* ------------------- ROTAS ------------------- */
+
+// saúde
+app.get('/health', (_req, res) => {
+  res.json({ success: true, service: 'whatsapp-baileys', sessionsDir: SESSIONS_DIR });
 });
 
-app.get("/status/:id", async (req, res) => {
+// status + QR embutido
+app.get('/status/:id', async (req, res) => {
+  const { id } = req.params;
+  const inst = instances.get(String(id));
+  res.json({
+    success: true,
+    exists: !!inst,
+    connected: !!inst?.connected,
+    state: inst?.state || 'none',
+    qrCode: inst?.qr || null,
+    lastQrAt: inst?.lastQrAt || null
+  });
+});
+
+// QR dedicado
+app.get('/qr/:id', (req, res) => {
+  const { id } = req.params;
+  const inst = instances.get(String(id));
+  if (!inst?.qr) return res.json({ success: false, error: 'QR not available' });
+  res.json({ success: true, qrCode: inst.qr, lastQrAt: inst.lastQrAt });
+});
+
+// reconectar (rápido)
+app.post('/reconnect/:id', async (req, res) => {
+  const { id } = req.params;
   try {
-    const id = asId(req.params.id);
-    const ctx = await ensureInstance(id);
-    res.json({
-      success: true,
-      instance: id,
-      connected: !!ctx.connected,
-      state: ctx.stateStr,
-      phone: ctx.phone,
-      qrCode: ctx.lastQr?.code || null,
-      qrDataUrl: ctx.lastQr?.dataUrl || null
-    });
-  } catch (err) {
-    log.error({ err }, "status error");
-    res.status(500).json({ success: false, error: "status_failed" });
+    await ensureInstance(id);
+    res.json({ success: true, message: 'Reconnecting/connecting…' });
+  } catch (e) {
+    res.status(500).json({ success: false, error: String(e) });
   }
 });
 
-app.get("/qr/:id", async (req, res) => {
+// forçar novo QR (responde rápido e roda em background)
+app.post('/force-qr/:id', async (req, res) => {
+  const { id } = req.params;
+  res.json({ success: true, message: 'Forcing new QR in background' });
+  // background
   try {
-    const id = asId(req.params.id);
-    const ctx = await ensureInstance(id);
+    await ensureInstance(id, { forceNew: true });
+  } catch { /* log silencioso */ }
+});
 
-    if (ctx.connected) {
-      return res.json({ success: true, connected: true, qrCode: null, qrDataUrl: null });
+// pairing code (para aparelhos compatíveis)
+app.post('/pairing-code/:id', async (req, res) => {
+  const { id } = req.params;
+  const phone = (req.body?.phoneNumber || '').replace(/\D/g, '');
+  if (!phone) return res.status(400).json({ success: false, error: 'phoneNumber required' });
+
+  try {
+    const inst = await ensureInstance(id);
+    if (typeof inst.sock?.requestPairingCode !== 'function') {
+      return res.json({ success: false, error: 'pairing-code not supported in this version' });
     }
-    if (!ctx.lastQr) {
-      return res.status(404).json({ success: false, error: "qr_not_ready" });
-    }
-    res.json({
-      success: true,
-      connected: false,
-      qrCode: ctx.lastQr.code,
-      qrDataUrl: ctx.lastQr.dataUrl
-    });
-  } catch (err) {
-    log.error({ err }, "qr error");
-    res.status(500).json({ success: false, error: "qr_failed" });
+    const code = await inst.sock.requestPairingCode(phone);
+    res.json({ success: true, pairingCode: code });
+  } catch (e) {
+    res.status(500).json({ success: false, error: String(e) });
   }
 });
 
-app.post("/force-qr/:id", async (req, res) => {
+// enviar mensagem
+app.post('/send/:id', async (req, res) => {
+  const { id } = req.params;
+  const { number, message } = req.body || {};
+  if (!number || !message) return res.status(400).json({ success: false, error: 'number and message required' });
+
   try {
-    const id = asId(req.params.id);
-    // sempre recria para forçar QR novo
-    instances.delete(id);
-    const ctx = await ensureInstance(id);
-
-    // aguarda até pintar o primeiro QR (ou 10s timeout)
-    const startedAt = Date.now();
-    while (!ctx.lastQr && Date.now() - startedAt < 10_000) {
-      // pequeno delay
-      // eslint-disable-next-line no-await-in-loop
-      await new Promise((r) => setTimeout(r, 300));
-    }
-
-    if (ctx.lastQr) {
-      return res.json({
-        success: true,
-        instance: id,
-        qrCode: ctx.lastQr.code,
-        qrDataUrl: ctx.lastQr.dataUrl
-      });
-    }
-    return res.status(202).json({ success: true, instance: id, message: "qr_pending" });
-  } catch (err) {
-    log.error({ err }, "force-qr error");
-    res.status(500).json({ success: false, error: "force_qr_failed" });
-  }
-});
-
-app.post("/send/:id", async (req, res) => {
-  try {
-    const id = asId(req.params.id);
-    const { number, message } = req.body || {};
-    if (!number || !message) {
-      return res.status(400).json({ success: false, error: "number_and_message_required" });
-    }
-
-    const ctx = await ensureInstance(id);
-    if (!ctx.connected) {
-      return res
-        .status(409)
-        .json({ success: false, error: "not_connected", hint: "scan_qr_first" });
-    }
-
-    const jid = number.replace(/\D/g, "") + "@s.whatsapp.net";
-    const sent = await ctx.sock.sendMessage(jid, { text: message });
+    const inst = await ensureInstance(id);
+    const jid = jidFromNumber(number);
+    const sent = await inst.sock.sendMessage(jid, { text: message });
     res.json({ success: true, messageId: sent?.key?.id || null });
-  } catch (err) {
-    log.error({ err }, "send error");
-    res.status(500).json({ success: false, error: "send_failed" });
+  } catch (e) {
+    res.status(500).json({ success: false, error: String(e) });
   }
 });
 
-app.post("/disconnect/:id", async (req, res) => {
+// desconectar
+app.post('/disconnect/:id', async (req, res) => {
+  const { id } = req.params;
   try {
-    const id = asId(req.params.id);
-    const ctx = instances.get(id);
-    if (ctx?.sock) {
-      try { await ctx.sock.logout(); } catch {}
-      try { ctx.sock.end?.(); } catch {}
-    }
-    instances.delete(id);
-    // não apaga credenciais (para manter login); se quiser “limpar”, remova a pasta:
-    // await fs.rm(path.join(SESSIONS_DIR, id), { recursive: true, force: true });
+    const inst = instances.get(String(id));
+    if (inst?.sock?.logout) await inst.sock.logout();
+    instances.delete(String(id));
     res.json({ success: true });
-  } catch (err) {
-    log.error({ err }, "disconnect error");
-    res.status(500).json({ success: false, error: "disconnect_failed" });
+  } catch (e) {
+    res.status(500).json({ success: false, error: String(e) });
   }
 });
 
-app.post("/reconnect/:id", async (req, res) => {
-  try {
-    const id = asId(req.params.id);
-    instances.delete(id);
-    const ctx = await ensureInstance(id);
-    res.json({ success: true, connected: ctx.connected, state: ctx.stateStr });
-  } catch (err) {
-    log.error({ err }, "reconnect error");
-    res.status(500).json({ success: false, error: "reconnect_failed" });
-  }
+app.listen(PORT, () => {
+  console.log(`WhatsApp service listening on :${PORT}`);
 });
-
-app.listen(PORT, () => log.info(`WhatsApp service listening on :${PORT}`));
