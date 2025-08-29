@@ -1,13 +1,19 @@
 {
   "name": "whatsapp-service",
   "version": "1.0.0",
-  "private": true,
+  "description": "REST wrapper do Baileys com sessões por usuário",
   "type": "module",
-  "engines": { "node": ">=20" },
-  "scripts": { "start": "node whatsapp_baileys_multi.js" },
+  "main": "whatsapp_baileys_multi.js",
+  "scripts": {
+    "start": "node whatsapp_baileys_multi.js",
+    "start:dev": "node --watch whatsapp_baileys_multi.js"
+  },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.8",
-    "@hapi/boom": "^10.0.1",
-    "qrcode": "^1.5.3"
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "pino": "^9.3.2",
+    "qrcode": "^1.5.4"
   }
 }
+
