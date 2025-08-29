@@ -1,0 +1,14 @@
+{
+  "name": "whatsapp-service",
+  "private": true,
+  "type": "module",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node whatsapp_baileys_multi.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.8",
+    "@hapi/boom": "^10.0.1",
+    "qrcode": "^1.5.3"
+  }
+}
