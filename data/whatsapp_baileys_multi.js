@@ -1,59 +1,182 @@
-// whatsapp_baileys_multi.js  (ESM robusto)
-import * as baileys from '@whiskeysockets/baileys';
-import { Boom } from '@hapi/boom';
+import express from "express"
+import cors from "cors"
+import {
+  default as makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason
+} from "@whiskeysockets/baileys"
 
-function resolveMakeWASocket(mod) {
-  // tenta nas formas comuns
-  if (typeof mod?.default === 'function') return mod.default;
-  if (typeof mod?.makeWASocket === 'function') return mod.makeWASocket;
-  if (typeof mod?.default?.makeWASocket === 'function') return mod.default.makeWASocket;
+import P from "pino"
+import fs from "fs"
+import path from "path"
 
-  // último recurso: alguns bundles exportam tudo em "baileys" e a função vem com outro nome
-  for (const k of Object.keys(mod || {})) {
-    if (typeof mod[k] === 'function' && /make.*wa.*socket/i.test(k)) {
-      return mod[k];
+const app = express()
+app.use(cors())
+app.use(express.json())
+
+const PORT = process.env.PORT || 3001
+
+// Armazena instâncias de sockets por usuário
+const sessions = new Map()
+const qrCodes = new Map()
+
+// Função para inicializar sessão de usuário
+async function startSession(userId) {
+  const sessionPath = path.join("./sessions", userId.toString())
+
+  if (!fs.existsSync(sessionPath)) {
+    fs.mkdirSync(sessionPath, { recursive: true })
+  }
+
+  const { state, saveCreds } = await useMultiFileAuthState(sessionPath)
+
+  const sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: false,
+    logger: P({ level: "silent" })
+  })
+
+  sock.ev.on("creds.update", saveCreds)
+
+  sock.ev.on("connection.update", (update) => {
+    const { connection, qr, lastDisconnect } = update
+
+    if (qr) {
+      qrCodes.set(userId, qr)
+      console.log(`📲 Novo QR para user ${userId}`)
     }
-  }
-  return null;
-}
 
-const makeWASocket = resolveMakeWASocket(baileys);
-const { useMultiFileAuthState, DisconnectReason } = baileys;
+    if (connection === "close") {
+      const reason = lastDisconnect?.error?.output?.statusCode
+      console.log(`❌ Conexão fechada para ${userId}. Motivo:`, reason)
 
-if (!makeWASocket) {
-  console.error('Baileys exports:', Object.keys(baileys));
-  throw new TypeError('makeWASocket não encontrado nos exports do @whiskeysockets/baileys');
-}
-
-const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions';
-
-async function main() {
-  try {
-    const { state, saveCreds } = await useMultiFileAuthState(SESSIONS_DIR);
-
-    const sock = makeWASocket({
-      printQRInTerminal: true,
-      auth: state,
-      browser: ['ClientFlow', 'Chrome', '1.0.0'],
-      syncFullHistory: false,
-    });
-
-    sock.ev.on('creds.update', saveCreds);
-
-    sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
-      if (qr) console.log('QR pronto! Escaneie no WhatsApp.');
-      if (connection === 'open') console.log('✅ WhatsApp conectado');
-      if (connection === 'close') {
-        const status = lastDisconnect?.error?.output?.statusCode;
-        console.log('❌ Conexão fechada. status:', status);
-        if (status !== DisconnectReason.loggedOut) setTimeout(main, 1500);
-        else console.log('⚠️ Sessão deslogada. Escaneie o QR novamente.');
+      if (reason !== DisconnectReason.loggedOut) {
+        console.log(`🔄 Tentando reconectar ${userId}...`)
+        startSession(userId)
+      } else {
+        console.log(`🛑 Usuário ${userId} deslogado`)
+        sessions.delete(userId)
       }
-    });
-  } catch (err) {
-    console.error('Erro no Baileys:', err);
-    process.exit(1);
-  }
+    } else if (connection === "open") {
+      console.log(`✅ Sessão ${userId} conectada com sucesso`)
+    }
+  })
+
+  sessions.set(userId, sock)
+  return sock
 }
 
-main();
+// ------------------ ROTAS REST ------------------
+
+// Obter QR Code atual
+app.get("/qr/:userId", (req, res) => {
+  const { userId } = req.params
+  const qr = qrCodes.get(userId)
+
+  if (qr) {
+    res.json({ success: true, qrCode: qr })
+  } else {
+    res.json({ success: false, error: "QR Code não disponível" })
+  }
+})
+
+// Enviar mensagem
+app.post("/send/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params
+    const { number, message } = req.body
+
+    let sock = sessions.get(userId)
+    if (!sock) sock = await startSession(userId)
+
+    const jid = number.replace(/\D/g, "") + "@s.whatsapp.net"
+
+    await sock.sendMessage(jid, { text: message })
+    res.json({ success: true, to: number, message })
+  } catch (e) {
+    res.json({ success: false, error: e.message })
+  }
+})
+
+// Status da sessão
+app.get("/status/:userId", async (req, res) => {
+  const { userId } = req.params
+  const sock = sessions.get(userId)
+
+  if (sock?.user) {
+    res.json({
+      success: true,
+      connected: true,
+      state: "open",
+      user: sock.user
+    })
+  } else {
+    res.json({
+      success: true,
+      connected: false,
+      state: "disconnected"
+    })
+  }
+})
+
+// Desconectar sessão
+app.post("/disconnect/:userId", (req, res) => {
+  const { userId } = req.params
+  const sock = sessions.get(userId)
+
+  if (sock) {
+    sock.logout()
+    sessions.delete(userId)
+    res.json({ success: true, message: "Sessão desconectada" })
+  } else {
+    res.json({ success: false, error: "Sessão não encontrada" })
+  }
+})
+
+// Reconectar sessão
+app.post("/reconnect/:userId", async (req, res) => {
+  const { userId } = req.params
+  try {
+    await startSession(userId)
+    res.json({ success: true, message: "Reconexão iniciada" })
+  } catch (e) {
+    res.json({ success: false, error: e.message })
+  }
+})
+
+// Restaurar sessão (se já existir)
+app.post("/restore/:userId", async (req, res) => {
+  const { userId } = req.params
+  try {
+    await startSession(userId)
+    res.json({ success: true, message: "Sessão restaurada" })
+  } catch (e) {
+    res.json({ success: false, error: e.message })
+  }
+})
+
+// Forçar novo QR
+app.post("/force-qr/:userId", async (req, res) => {
+  const { userId } = req.params
+  qrCodes.delete(userId)
+  await startSession(userId)
+
+  setTimeout(() => {
+    const qr = qrCodes.get(userId)
+    if (qr) {
+      res.json({ success: true, qrCode: qr })
+    } else {
+      res.json({ success: false, error: "QR ainda não gerado" })
+    }
+  }, 3000)
+})
+
+// Healthcheck
+app.get("/health", (req, res) => {
+  res.json({ success: true, status: "ok", sessions: [...sessions.keys()] })
+})
+
+// Iniciar servidor
+app.listen(PORT, () => {
+  console.log(`🚀 WhatsApp server rodando na porta ${PORT}`)
+})
