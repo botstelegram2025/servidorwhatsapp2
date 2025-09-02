@@ -2,16 +2,19 @@
   "name": "whatsapp-service",
   "version": "1.0.0",
   "type": "module",
-  "private": true,
+  "main": "whatsapp_baileys_multi.js",
   "scripts": {
     "start": "node whatsapp_baileys_multi.js"
   },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.9",
-    "cors": "^2.8.5",
     "express": "^4.19.2",
+    "cors": "^2.8.5",
     "morgan": "^1.10.0",
-    "pino": "^9.3.2",
-    "qrcode": "^1.5.3"
+    "qrcode": "^1.5.3",
+    "pino": "^9.4.0"
   }
 }
