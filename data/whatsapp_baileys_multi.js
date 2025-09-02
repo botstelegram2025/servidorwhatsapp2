@@ -7,19 +7,14 @@ import fsp from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import qrcode from 'qrcode';
-import pino from 'pino';
-import * as baileys from '@whiskeysockets/baileys';
-
-const {
+import P from 'pino';
+import {
+  makeWASocket,
   DisconnectReason,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
-  Browsers,
-} = baileys;
-
-const makeWASocket =
-  // garante compatibilidade entre versões do pacote (default vs named)
-  (baileys.makeWASocket || baileys.default || baileys);
+  Browsers
+} from '@whiskeysockets/baileys';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -36,13 +31,12 @@ app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('tiny'));
 
-// id -> { sock, qr, lastQrAt, connected, state, saveCreds }
-const instances = new Map();
+const instances = new Map(); // id -> { sock, qr, lastQrAt, connected, state, saveCreds }
 
 // utils
-const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+const wait = (ms) => new Promise(r => setTimeout(r, ms));
 const j = (...xs) => path.join(...xs);
-const jidFromNumber = (n) => `${String(n).replace(/\D/g, '')}@s.whatsapp.net`;
+const jidFromNumber = (n) => `${n.replace(/\D/g, '')}@s.whatsapp.net`;
 
 async function destroyAuth(id) {
   const p = j(SESSIONS_DIR, String(id));
@@ -54,13 +48,9 @@ async function destroyAuth(id) {
 async function ensureInstance(id, { forceNew = false } = {}) {
   id = String(id);
   if (forceNew) {
-    try {
-      await destroyAuth(id);
-    } catch {}
+    await destroyAuth(id);
     if (instances.has(id)) {
-      try {
-        await instances.get(id).sock?.logout?.();
-      } catch {}
+      try { await instances.get(id).sock?.logout?.(); } catch {/* ignore */}
       instances.delete(id);
     }
   }
@@ -70,15 +60,14 @@ async function ensureInstance(id, { forceNew = false } = {}) {
   const authPath = j(SESSIONS_DIR, id);
   const { state, saveCreds } = await useMultiFileAuthState(authPath);
   const { version } = await fetchLatestBaileysVersion();
+  const logger = P({ level: 'error' }); // silencioso
 
-  const logger = pino({ level: 'error' }); // silencioso no server
   const sock = makeWASocket({
     version,
     logger,
     auth: state,
-    // opção deprecada — mantemos false para não poluir terminal
-    printQRInTerminal: false,
-    browser: Browsers.appropriate('Chrome'),
+    printQRInTerminal: false, // deprecado
+    browser: Browsers.appropriate('Chrome')
   });
 
   const data = {
@@ -87,7 +76,7 @@ async function ensureInstance(id, { forceNew = false } = {}) {
     lastQrAt: null,
     connected: false,
     state: 'starting',
-    saveCreds,
+    saveCreds
   };
   instances.set(id, data);
 
@@ -116,15 +105,10 @@ async function ensureInstance(id, { forceNew = false } = {}) {
     if (connection === 'close') {
       data.connected = false;
       data.state = 'close';
-      const reason =
-        lastDisconnect?.error?.output?.statusCode ||
-        lastDisconnect?.error?.code;
-      // tenta reconectar exceto se foi logout explícito
+      const reason = lastDisconnect?.error?.output?.statusCode || lastDisconnect?.error?.code;
       if (reason !== DisconnectReason.loggedOut) {
         await wait(1000);
-        try {
-          ensureInstance(id);
-        } catch {}
+        try { ensureInstance(id); } catch {/* ignore */}
       }
     }
   });
@@ -132,19 +116,17 @@ async function ensureInstance(id, { forceNew = false } = {}) {
   return data;
 }
 
-/* ============ ROTAS ============ */
+/* ------------------- ROTAS ------------------- */
+
+// raiz (ping)
+app.get('/', (_req, res) => res.json({ ok: true, service: 'whatsapp-baileys' }));
 
 // health
 app.get('/health', (_req, res) => {
-  res.json({
-    success: true,
-    service: 'whatsapp-baileys',
-    sessionsDir: SESSIONS_DIR,
-    up: true,
-  });
+  res.json({ success: true, service: 'whatsapp-baileys', sessionsDir: SESSIONS_DIR, time: Date.now() });
 });
 
-// status com QR embutido
+// status + QR embutido
 app.get('/status/:id', async (req, res) => {
   const { id } = req.params;
   const inst = instances.get(String(id));
@@ -154,7 +136,7 @@ app.get('/status/:id', async (req, res) => {
     connected: !!inst?.connected,
     state: inst?.state || 'none',
     qrCode: inst?.qr || null,
-    lastQrAt: inst?.lastQrAt || null,
+    lastQrAt: inst?.lastQrAt || null
   });
 });
 
@@ -162,13 +144,11 @@ app.get('/status/:id', async (req, res) => {
 app.get('/qr/:id', (req, res) => {
   const { id } = req.params;
   const inst = instances.get(String(id));
-  if (!inst?.qr) {
-    return res.json({ success: false, error: 'QR not available' });
-  }
+  if (!inst?.qr) return res.json({ success: false, error: 'QR not available' });
   res.json({ success: true, qrCode: inst.qr, lastQrAt: inst.lastQrAt });
 });
 
-// conectar/reconectar rápido
+// reconectar (cria/reativa instância rapidamente)
 app.post('/reconnect/:id', async (req, res) => {
   const { id } = req.params;
   try {
@@ -179,16 +159,16 @@ app.post('/reconnect/:id', async (req, res) => {
   }
 });
 
-// força novo QR (responde já; recria sessão em background)
+// forçar novo QR (responde já e reconstroi em background)
 app.post('/force-qr/:id', async (req, res) => {
   const { id } = req.params;
   res.json({ success: true, message: 'Forcing new QR in background' });
   try {
     await ensureInstance(id, { forceNew: true });
-  } catch {}
+  } catch {/* ignore */}
 });
 
-// pairing code (se suportado)
+// pairing code (opcional / aparelhos compatíveis)
 app.post('/pairing-code/:id', async (req, res) => {
   const { id } = req.params;
   const phone = (req.body?.phoneNumber || '').replace(/\D/g, '');
@@ -210,9 +190,7 @@ app.post('/pairing-code/:id', async (req, res) => {
 app.post('/send/:id', async (req, res) => {
   const { id } = req.params;
   const { number, message } = req.body || {};
-  if (!number || !message) {
-    return res.status(400).json({ success: false, error: 'number and message required' });
-  }
+  if (!number || !message) return res.status(400).json({ success: false, error: 'number and message required' });
 
   try {
     const inst = await ensureInstance(id);
